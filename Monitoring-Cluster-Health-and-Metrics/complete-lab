@@ -1,0 +1,482 @@
+Lab: Monitoring Cluster Health and Metrics with Prometheus and Grafana
+Objectives
+By the end of this lab, you will be able to:
+
+Deploy the Prometheus Operator and a Prometheus instance to monitor an OpenShift/Kubernetes cluster
+Configure ServiceMonitors so Prometheus discovers and scrapes metrics targets
+Deploy Grafana and connect it to Prometheus as a data source
+Create Prometheus alerting rules for resource utilization thresholds and verify they load correctly
+Apply basic troubleshooting techniques for common monitoring stack issues
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of Kubernetes and OpenShift concepts (Deployments, Services, Namespaces)
+Familiarity with YAML configuration files
+Comfort with Linux command-line operations
+Access to an OpenShift cluster with cluster-admin privileges and the oc CLI installed
+This lab uses only the oc CLI and manifests applied directly to the cluster, so no additional local packages need to be installed. If you are working in Al Nafi's pre-configured cloud machine, oc is already installed and connected to a working cluster â click Start Lab to begin.
+
+Verify your CLI and cluster connectivity before proceeding:
+
+oc version --client
+oc whoami
+You should see the client version printed and your logged-in username returned. If oc whoami fails, log in first with oc login <cluster-api-url> using credentials provided by your lab environment.
+
+Task 1: Deploy Prometheus and Configure Metric Scraping
+Step 1.1: Create a Monitoring Namespace
+oc new-project monitoring-lab
+oc project monitoring-lab
+Verify the namespace exists:
+
+oc get project monitoring-lab
+Deliverable: The command returns the monitoring-lab project with status Active.
+
+Step 1.2: Deploy the Prometheus Operator
+The Prometheus Operator manages Prometheus and Alertmanager instances declaratively through Custom Resource Definitions (CRDs). Most OpenShift clusters already ship the operator and CRDs as part of the built-in cluster-monitoring stack; this lab installs a second, independent instance in monitoring-lab so you can safely practice without touching cluster-wide monitoring.
+
+Create the RBAC resources the operator needs:
+
+cat << 'EOF' > prometheus-operator-rbac.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus-operator
+  namespace: monitoring-lab
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus-operator-monitoring-lab
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "services", "endpoints", "pods", "configmaps", "secrets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["statefulsets"]
+  verbs: ["get", "list", "watch", "create", "update", "delete"]
+- apiGroups: ["monitoring.coreos.com"]
+  resources: ["*"]
+  verbs: ["*"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus-operator-monitoring-lab
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus-operator-monitoring-lab
+subjects:
+- kind: ServiceAccount
+  name: prometheus-operator
+  namespace: monitoring-lab
+EOF
+oc apply -f prometheus-operator-rbac.yaml
+Deploy the operator:
+
+cat << 'EOF' > prometheus-operator.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus-operator
+  namespace: monitoring-lab
+  labels:
+    app: prometheus-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus-operator
+  template:
+    metadata:
+      labels:
+        app: prometheus-operator
+    spec:
+      serviceAccountName: prometheus-operator
+      containers:
+      - name: prometheus-operator
+        image: quay.io/prometheus-operator/prometheus-operator:v0.71.2
+        args:
+        - --prometheus-config-reloader=quay.io/prometheus-operator/prometheus-config-reloader:v0.71.2
+        ports:
+        - containerPort: 8080
+          name: http
+        resources:
+          requests:
+            cpu: 100m
+            memory: 100Mi
+          limits:
+            cpu: 200m
+            memory: 200Mi
+EOF
+oc apply -f prometheus-operator.yaml
+Verify the operator pod is running:
+
+oc get pods -l app=prometheus-operator
+oc wait --for=condition=Available deployment/prometheus-operator -n monitoring-lab --timeout=120s
+Deliverable: oc get pods -l app=prometheus-operator shows a pod in Running status with 1/1 ready containers, and the oc wait command reports deployment.apps/prometheus-operator condition met.
+
+Step 1.3: Deploy a Prometheus Instance
+Create the ServiceAccount and RBAC Prometheus itself will run as:
+
+cat << 'EOF' > prometheus-sa.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring-lab
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus-monitoring-lab
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "services", "endpoints", "pods"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get"]
+- nonResourceURLs: ["/metrics"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus-monitoring-lab
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus-monitoring-lab
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: monitoring-lab
+EOF
+oc apply -f prometheus-sa.yaml
+Create the Prometheus custom resource:
+
+cat << 'EOF' > prometheus-instance.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: Prometheus
+metadata:
+  name: prometheus-main
+  namespace: monitoring-lab
+spec:
+  serviceAccountName: prometheus
+  serviceMonitorSelector:
+    matchLabels:
+      team: monitoring-lab
+  ruleSelector:
+    matchLabels:
+      team: monitoring-lab
+  resources:
+    requests:
+      memory: 400Mi
+      cpu: 100m
+    limits:
+      memory: 800Mi
+      cpu: 200m
+  retention: 1d
+  replicas: 1
+EOF
+oc apply -f prometheus-instance.yaml
+Expose Prometheus with a Service and a Route:
+
+cat << 'EOF' > prometheus-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-service
+  namespace: monitoring-lab
+spec:
+  selector:
+    app.kubernetes.io/name: prometheus
+    prometheus: prometheus-main
+  ports:
+  - name: web
+    port: 9090
+    targetPort: 9090
+EOF
+oc apply -f prometheus-service.yaml
+oc expose service prometheus-service --name=prometheus-route
+Verify Prometheus is running and reachable:
+
+oc get prometheus
+oc get pods -l app.kubernetes.io/name=prometheus
+oc get route prometheus-route
+Deliverable: oc get pods -l app.kubernetes.io/name=prometheus shows a pod named prometheus-prometheus-main-0 in Running state, and oc get route prometheus-route returns a hostname you can use to reach the Prometheus web UI.
+
+Step 1.4: Deploy Node Exporter and Create a ServiceMonitor
+Node Exporter exposes host-level metrics (CPU, memory, disk) that Prometheus can scrape.
+
+cat << 'EOF' > node-exporter.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: monitoring-lab
+  labels:
+    app: node-exporter
+spec:
+  selector:
+    matchLabels:
+      app: node-exporter
+  template:
+    metadata:
+      labels:
+        app: node-exporter
+    spec:
+      hostNetwork: true
+      hostPID: true
+      containers:
+      - name: node-exporter
+        image: quay.io/prometheus/node-exporter:v1.7.0
+        args:
+        - --path.procfs=/host/proc
+        - --path.sysfs=/host/sys
+        ports:
+        - containerPort: 9100
+          hostPort: 9100
+          name: metrics
+        volumeMounts:
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: sys
+          mountPath: /host/sys
+          readOnly: true
+        resources:
+          requests:
+            cpu: 50m
+            memory: 50Mi
+          limits:
+            cpu: 100m
+            memory: 100Mi
+      volumes:
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: sys
+        hostPath:
+          path: /sys
+      tolerations:
+      - operator: Exists
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-exporter
+  namespace: monitoring-lab
+  labels:
+    app: node-exporter
+    team: monitoring-lab
+spec:
+  clusterIP: None
+  ports:
+  - name: metrics
+    port: 9100
+    targetPort: 9100
+  selector:
+    app: node-exporter
+EOF
+oc apply -f node-exporter.yaml
+Create the ServiceMonitor that tells Prometheus to scrape Node Exporter. Note that the spec.selector.matchLabels here must match the labels on the node-exporter Service above, and the team: monitoring-lab label on the ServiceMonitor's own metadata must match Prometheus's serviceMonitorSelector from Step 1.3:
+
+cat << 'EOF' > node-exporter-servicemonitor.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: node-exporter
+  namespace: monitoring-lab
+  labels:
+    team: monitoring-lab
+spec:
+  selector:
+    matchLabels:
+      app: node-exporter
+  endpoints:
+  - port: metrics
+    interval: 30s
+    path: /metrics
+EOF
+oc apply -f node-exporter-servicemonitor.yaml
+Verify Node Exporter pods are running and Prometheus has picked up the target:
+
+oc get pods -l app=node-exporter
+oc get servicemonitors
+Deliverable: oc get pods -l app=node-exporter shows one Running pod per cluster node. oc get servicemonitors lists node-exporter. In the Prometheus web UI (reachable at the prometheus-route hostname), navigating to Status > Targets shows a node-exporter job with state UP.
+
+Task 2: Deploy Grafana and Visualize Metrics
+Step 2.1: Configure and Deploy Grafana
+Create the datasource ConfigMap that points Grafana at the in-cluster Prometheus service:
+
+cat << 'EOF' > grafana-datasources.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: monitoring-lab
+data:
+  prometheus.yaml: |
+    apiVersion: 1
+    datasources:
+    - name: Prometheus
+      type: prometheus
+      access: proxy
+      url: http://prometheus-service:9090
+      isDefault: true
+      editable: true
+EOF
+oc apply -f grafana-datasources.yaml
+Deploy Grafana:
+
+cat << 'EOF' > grafana-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: monitoring-lab
+  labels:
+    app: grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      containers:
+      - name: grafana
+        image: docker.io/grafana/grafana:10.4.2
+        ports:
+        - containerPort: 3000
+        env:
+        - name: GF_SECURITY_ADMIN_PASSWORD
+          value: "admin123"
+        volumeMounts:
+        - name: grafana-storage
+          mountPath: /var/lib/grafana
+        - name: grafana-datasources
+          mountPath: /etc/grafana/provisioning/datasources
+        resources:
+          requests:
+            cpu: 100m
+            memory: 200Mi
+          limits:
+            cpu: 200m
+            memory: 400Mi
+      volumes:
+      - name: grafana-storage
+        emptyDir: {}
+      - name: grafana-datasources
+        configMap:
+          name: grafana-datasources
+EOF
+oc apply -f grafana-deployment.yaml
+Expose Grafana:
+
+cat << 'EOF' > grafana-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana-service
+  namespace: monitoring-lab
+spec:
+  selector:
+    app: grafana
+  ports:
+  - port: 3000
+    targetPort: 3000
+EOF
+oc apply -f grafana-service.yaml
+oc expose service grafana-service --name=grafana-route
+Verify the deployment:
+
+oc get pods -l app=grafana
+oc get route grafana-route
+Deliverable: oc get pods -l app=grafana shows a Running pod. Opening http://<grafana-route-host> in a browser and logging in with username admin and password admin123 shows the Grafana home page.
+
+Step 2.2: Confirm the Prometheus Data Source and View Metrics
+In the Grafana UI, go to Connections > Data sources and confirm Prometheus is listed and marked as the default source (provisioned automatically from the ConfigMap).
+Click Explore, select the Prometheus data source, and run the query:
+up
+Run a second query to confirm Node Exporter metrics are flowing:
+node_cpu_seconds_total
+Deliverable: The up query returns a table/graph with one row per scrape target (including node-exporter) with a value of 1, confirming Prometheus is successfully collecting metrics that Grafana can visualize.
+
+Task 3: Create and Verify Prometheus Alert Rules
+Step 3.1: Create Alert Rules for Resource Utilization
+Create a PrometheusRule resource with alerts for high CPU and high memory usage. The team: monitoring-lab label must match the ruleSelector configured on the Prometheus instance in Task 1:
+
+cat << 'EOF' > cluster-alerts.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: cluster-alerts
+  namespace: monitoring-lab
+  labels:
+    team: monitoring-lab
+spec:
+  groups:
+  - name: cluster.rules
+    rules:
+    - alert: HighNodeCPUUsage
+      expr: 100 - (avg by (instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "High CPU usage on {{ $labels.instance }}"
+        description: "CPU usage has been above 80 percent for more than 5 minutes."
+    - alert: HighNodeMemoryUsage
+      expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "High memory usage on {{ $labels.instance }}"
+        description: "Memory usage has been above 85 percent for more than 5 minutes."
+EOF
+oc apply -f cluster-alerts.yaml
+Verify the rule object was created:
+
+oc get prometheusrules
+Deliverable: oc get prometheusrules lists cluster-alerts.
+
+Step 3.2: Verify Prometheus Loaded the Rules
+Query the Prometheus API directly to confirm the rules were picked up (this avoids relying on browser access and works from the command line):
+
+PROMETHEUS_HOST=$(oc get route prometheus-route -o jsonpath='{.spec.host}')
+curl -s "http://${PROMETHEUS_HOST}/api/v1/rules" | grep -o '"name":"[A-Za-z]*"'
+Deliverable: The output includes "name":"HighNodeCPUUsage" and "name":"HighNodeMemoryUsage", confirming Prometheus loaded the PrometheusRule resource through the ruleSelector match. You can also check target and rule health visually at Status > Rules in the Prometheus web UI.
+
+Expected Outcomes
+A running Prometheus instance in the monitoring-lab namespace scraping metrics from Node Exporter via a correctly labeled ServiceMonitor
+A Grafana deployment provisioned with a working Prometheus data source, capable of querying live cluster metrics
+Two active Prometheus alerting rules (HighNodeCPUUsage, HighNodeMemoryUsage) confirmed loaded through the Prometheus HTTP API
+Troubleshooting
+Issue 1: ServiceMonitor Target Shows as "Down" or Missing in Prometheus
+Symptom: The node-exporter job does not appear, or appears with state DOWN, under Status > Targets in the Prometheus UI.
+
+Diagnostic hint: Compare the labels on the ServiceMonitor's spec.selector.matchLabels against the actual labels on the target Service, and compare the ServiceMonitor's own metadata labels against the Prometheus serviceMonitorSelector. A mismatch in either place is the most common cause. Check both directly:
+
+oc get service node-exporter -o jsonpath='{.metadata.labels}'
+oc get servicemonitor node-exporter -o jsonpath='{.spec.selector.matchLabels}'
+oc get servicemonitor node-exporter -o jsonpath='{.metadata.labels}'
+oc get prometheus prometheus-main -o jsonpath='{.spec.serviceMonitorSelector.matchLabels}'
+If the label sets shown by the first two commands do not intersect, or the last two do not match, update the mismatched manifest and reapply it with oc apply -f.
+
+Issue 2: Grafana Dashboard Shows "No Data"
+Symptom: Explore or dashboard panels in Grafana return empty results even though Prometheus targets are UP.
+
+Diagnostic hint: Confirm Grafana can actually reach the Prometheus service URL configured in the datasource, and confirm the metric name used in the query exists in Prometheus at all:
+
+oc exec deployment/grafana -n monitoring-lab -- curl -s http://prometheus-service:9090/api/v1/query?query=up
+If this returns a valid JSON result but the Grafana panel is still empty, check the panel's time range and PromQL syntax rather than the network path.
+
+Conclusion
+In this lab you deployed a self-contained Prometheus and Grafana monitoring stack in its own namespace, using the Prometheus Operator to manage a Prometheus instance, a Node Exporter DaemonSet for host metrics, and a ServiceMonitor to wire the two together. You connected Grafana to Prometheus as a provisioned data source and confirmed metrics were queryable end to end, then defined and verified Prometheus alerting rules for high CPU and memory usage directly through the Prometheus HTTP API. Along the way you practiced the label-matching relationships that tie ServiceMonitors, Services, and PrometheusRules to a Prometheus instance's selectors, which is the most common source of "missing metrics" or "missing alerts" problems in real deployments. For production use, extend this pattern by adding Alertmanager with real notification receivers, persistent storage for Prometheus and Grafana instead of emptyDir, and stricter RBAC scoped to only the resources each component needs.
